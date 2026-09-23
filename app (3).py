@@ -1,0 +1,995 @@
+import os
+import re
+import json
+import uuid
+import base64
+import shutil
+import subprocess
+import tempfile
+import time
+import random
+from contextvars import ContextVar
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template_string, send_file
+from flask_cors import CORS
+from google import genai
+from google.genai import types
+
+app = Flask(__name__)
+CORS(app)
+
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",") if m.strip()]
+GEMINI_RETRY_ATTEMPTS = max(1, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "3")))
+GEMINI_INITIAL_BACKOFF = max(0.1, float(os.getenv("GEMINI_INITIAL_BACKOFF", "2")))
+GEMINI_MAX_BACKOFF = max(GEMINI_INITIAL_BACKOFF, float(os.getenv("GEMINI_MAX_BACKOFF", "8")))
+GEMINI_429_RETRIES = max(0, int(os.getenv("GEMINI_429_RETRIES", "1")))
+# Gemini 3.x can spend noticeable time thinking. 15s was too aggressive for
+# a multi-stage RTL agent and caused httpx read timeouts on fallback models.
+GEMINI_REQUEST_TIMEOUT_SECONDS = max(8, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "25")))
+GEMINI_TIMEOUT_RETRIES = max(0, int(os.getenv("GEMINI_TIMEOUT_RETRIES", "1")))
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
+if GEMINI_THINKING_LEVEL not in {"minimal", "low", "medium", "high"}:
+    GEMINI_THINKING_LEVEL = "low"
+MAX_PIPELINE_SECONDS = max(20, float(os.getenv("MAX_PIPELINE_SECONDS", "105")))
+MAX_REPAIR_ATTEMPTS = int(os.getenv("MAX_REPAIR_ATTEMPTS", "4"))
+SIM_TIMEOUT_SECONDS = int(os.getenv("SIM_TIMEOUT_SECONDS", "20"))
+JOB_ROOT = Path(os.getenv("JOB_ROOT", "/tmp/rtl_ai_jobs"))
+JOB_ROOT.mkdir(parents=True, exist_ok=True)
+
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if API_KEY:
+    # Disable the SDK's own retry loop. We do bounded retries ourselves so that
+    # quota errors do not trigger long hidden waits before our fallback logic runs.
+    client = genai.Client(
+        api_key=API_KEY,
+        http_options=types.HttpOptions(
+            timeout=int(GEMINI_REQUEST_TIMEOUT_SECONDS * 1000),
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+else:
+    client = None
+
+
+HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ECE RTL AI Engineer</title>
+<style>
+:root{--bg:#080a0d;--panel:#11151a;--panel2:#0c0f13;--border:#252c35;--text:#f4f5f7;--muted:#9ca6b2;--gold:#d7b35a;--green:#39d98a;--red:#ff6574}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif}
+.wrap{max-width:1180px;margin:auto;padding:34px 22px 60px}
+header{margin-bottom:24px}
+h1{margin:0 0 7px;font-size:30px}
+.sub{color:var(--muted);font-size:15px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px;margin-top:18px}
+textarea{width:100%;min-height:150px;resize:vertical;background:var(--panel2);color:#fff;border:1px solid #303844;border-radius:12px;padding:15px;font-size:16px;line-height:1.5;outline:none}
+textarea:focus{border-color:#8c7339}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+button{margin-top:12px;background:var(--gold);color:#0a0b0d;border:0;border-radius:10px;padding:12px 20px;font-weight:800;cursor:pointer}
+button.secondary{background:#242b34;color:#fff}
+button:disabled{opacity:.55;cursor:not-allowed}
+.status{margin-top:16px;min-height:25px}
+.badge{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border-radius:9px;font-size:13px;font-weight:800}
+.ok{background:#103b28;color:#62e8a5}
+.bad{background:#451d24;color:#ff8793}
+.neutral{background:#242b34;color:#cbd2da}
+.result-title{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+h2{margin:0;font-size:19px}
+.code-wrap{position:relative;margin-top:15px}
+pre{margin:0;white-space:pre;overflow:auto;background:#07090c;border:1px solid #202731;border-radius:12px;padding:18px;font:14px/1.55 "SFMono-Regular",Consolas,"Liberation Mono",monospace;color:#e8edf3;tab-size:4}
+.copy-msg{color:var(--green);font-size:13px;margin-left:4px}
+.footer-status{margin-top:14px;color:var(--muted);font-size:14px}
+.hidden{display:none}
+.spinner{width:14px;height:14px;border:2px solid #ffffff44;border-top-color:#fff;border-radius:50%;display:inline-block;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>ECE RTL AI Engineer</h1>
+<div class="sub">Describe your digital hardware design and get verified Verilog/SystemVerilog.</div>
+</header>
+<div class="card">
+<textarea id="req" placeholder="Example: Design a parameterized synchronous FIFO with configurable depth and data width, active-low reset, full/empty flags, and safe read/write behavior."></textarea>
+<div class="actions"><button id="buildBtn" onclick="build()">Generate & Verify HDL</button></div>
+<div id="status" class="status"></div>
+</div>
+<div id="out" class="hidden">
+<div class="card">
+<div class="result-title"><h2>Generated SystemVerilog</h2><div><button class="secondary" onclick="copyCode()">Copy Code</button><span id="copyMsg" class="copy-msg"></span></div></div>
+<div class="code-wrap"><pre id="rtl"></pre></div>
+<div id="verifyStatus" class="footer-status"></div>
+</div>
+</div>
+</div>
+<script>
+let generatedRTL='';
+async function build(){
+  const req=document.getElementById('req').value.trim();
+  const btn=document.getElementById('buildBtn');
+  const status=document.getElementById('status');
+  const out=document.getElementById('out');
+  if(!req){status.innerHTML='<span class="badge bad">Enter a hardware requirement.</span>';return;}
+  btn.disabled=true;
+  btn.innerHTML='<span class="spinner"></span> Generating & verifying...';
+  status.innerHTML='<span class="badge neutral">AI hardware engineer is generating and verifying the design...</span>';
+  out.classList.add('hidden');
+  document.getElementById('copyMsg').textContent='';
+  try{
+    const r=await fetch('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request:req})});
+    const raw=await r.text();
+    let d={};
+    try{d=raw?JSON.parse(raw):{};}catch(e){throw new Error('Server returned an invalid response (HTTP '+r.status+').');}
+    if(!r.ok)throw new Error(d.error||'HDL generation failed.');
+    generatedRTL=d.rtl||'';
+    document.getElementById('rtl').textContent=generatedRTL;
+    const v=d.verification||{};
+    if(v.passed){
+      status.innerHTML='<span class="badge ok">✓ VERIFIED</span>';
+      document.getElementById('verifyStatus').textContent='✓ RTL compiled successfully and the automatically generated self-checking testbench passed.';
+    }else{
+      status.innerHTML='<span class="badge bad">⚠ NOT VERIFIED</span>';
+      document.getElementById('verifyStatus').textContent='The RTL was generated, but automated verification did not pass. Review the code before using it.';
+    }
+    out.classList.remove('hidden');
+    window.scrollTo({top:out.offsetTop-20,behavior:'smooth'});
+  }catch(e){status.innerHTML='<span class="badge bad">'+esc(e?.message||String(e))+'</span>';
+  }finally{btn.disabled=false;btn.textContent='Generate & Verify HDL';}
+}
+async function copyCode(){
+  if(!generatedRTL)return;
+  try{await navigator.clipboard.writeText(generatedRTL);document.getElementById('copyMsg').textContent='Copied';setTimeout(()=>document.getElementById('copyMsg').textContent='',1500);}
+  catch(e){document.getElementById('copyMsg').textContent='Copy failed';}
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+</script>
+</body>
+</html>
+"""
+
+def require_client():
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+TRANSIENT_GEMINI_CODES = {408, 500, 502, 503, 504}
+
+class GeminiServiceError(RuntimeError):
+    """Clean, API-safe Gemini failure that can be returned as JSON."""
+    def __init__(self, message, *, code="gemini_error", status=503, retryable=False, details=None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.retryable = retryable
+        self.details = details or {}
+
+class GeminiQuotaError(GeminiServiceError):
+    def __init__(self, models):
+        names = ", ".join(models)
+        super().__init__(
+            f"Gemini API quota is exhausted for the configured models ({names}). "
+            "No more automatic retries will be made for this build. Check the Gemini API quota/billing or use a project with available quota.",
+            code="gemini_quota_exhausted",
+            status=429,
+            retryable=False,
+            details={"models": models},
+        )
+
+class GeminiUnavailableError(GeminiServiceError):
+    def __init__(self, message, details=None):
+        super().__init__(
+            message,
+            code="gemini_service_unavailable",
+            status=503,
+            retryable=True,
+            details=details,
+        )
+
+class PipelineTimeoutError(GeminiServiceError):
+    def __init__(self):
+        super().__init__(
+            "The hardware build exceeded the server safety time limit. "
+            "The request was stopped before the Render worker timeout.",
+            code="build_timeout",
+            status=504,
+            retryable=True,
+        )
+
+def _exception_code(exc):
+    for attr in ("code", "status_code", "http_status"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    m = re.search(r"\b(400|401|403|404|408|409|429|500|502|503|504)\b", str(exc))
+    return int(m.group(1)) if m else None
+
+def _is_timeout_error(exc):
+    """Detect HTTP/socket read/connect timeouts that may not carry an HTTP code."""
+    name = exc.__class__.__name__.lower()
+    text = str(exc).lower()
+    return (
+        "timeout" in name
+        or "timeout" in text
+        or "timed out" in text
+        or "read operation timed out" in text
+    )
+
+
+def _is_quota_exhausted(exc):
+    text = str(exc).lower()
+    quota_markers = (
+        "resource_exhausted",
+        "quota exceeded",
+        "exceeded your current quota",
+        "current quota",
+        "generaterequestsperday",
+        "perday",
+        "free_tier_requests",
+        "quota failure",
+        "quota_value",
+        "daily quota",
+    )
+    return _exception_code(exc) == 429 and any(marker in text for marker in quota_markers)
+
+def _retry_delay(exc, attempt):
+    # For 503/5xx use bounded exponential backoff with jitter.
+    delay = min(GEMINI_MAX_BACKOFF, GEMINI_INITIAL_BACKOFF * (2 ** max(0, attempt - 1)))
+
+    # Gemini may include "retry in 19.9s" for rate limiting. Never wait that
+    # long inside a synchronous Render request; the caller has a hard deadline.
+    m = re.search(r"retry(?: in| after)\s+([0-9]+(?:\.[0-9]+)?)\s*s", str(exc), re.I)
+    if m:
+        try:
+            delay = min(delay, max(0.0, float(m.group(1))))
+        except ValueError:
+            pass
+
+    jitter = random.uniform(0, min(1.0, delay * 0.25)) if delay > 0 else 0
+    return delay + jitter
+
+def _model_sequence():
+    models = [MODEL]
+    for model in FALLBACK_MODELS:
+        if model and model not in models:
+            models.append(model)
+    return models
+
+def _friendly_gemini_error(exc, model):
+    code = _exception_code(exc)
+    if _is_quota_exhausted(exc):
+        return f"Gemini API quota is exhausted for model '{model}'."
+    if code == 429:
+        return f"Gemini model '{model}' is temporarily rate-limited (429)."
+    if _is_timeout_error(exc):
+        return f"Gemini model '{model}' did not respond within the configured timeout."
+    if code == 503:
+        return f"Gemini model '{model}' is temporarily unavailable (503)."
+    if code in (408, 500, 502, 504):
+        return f"Gemini model '{model}' returned a temporary service error ({code})."
+    if code == 401:
+        return "Gemini API authentication failed (401). Check GEMINI_API_KEY in Render."
+    if code == 403:
+        return "Gemini API access was denied (403). Check the API key/project permissions and model access."
+    if code == 404:
+        return f"Gemini model '{model}' was not found (404). Check GEMINI_MODEL/fallback model names."
+    return f"Gemini request failed for model '{model}': {exc}"
+
+PIPELINE_DEADLINE = ContextVar("pipeline_deadline", default=None)
+
+def _pipeline_deadline():
+    return PIPELINE_DEADLINE.get()
+
+def _set_pipeline_deadline(value):
+    return PIPELINE_DEADLINE.set(value)
+
+def _reset_pipeline_deadline(token):
+    PIPELINE_DEADLINE.reset(token)
+
+def _ensure_pipeline_time():
+    deadline = _pipeline_deadline()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise PipelineTimeoutError()
+    return deadline
+
+def gemini_text(prompt):
+    """Call Gemini with bounded retries, timeout handling, and model fallback.
+
+    Important: the SDK's own retry loop is disabled at client construction.
+    This function is the single place that decides whether to retry, wait,
+    switch models, or fail cleanly.
+    """
+    require_client()
+    _ensure_pipeline_time()
+    models = _model_sequence()
+    errors = []
+    quota_models = []
+
+    for model_index, model in enumerate(models):
+        _ensure_pipeline_time()
+        model_saw_quota = False
+        model_attempts = 0
+        max_attempts = max(GEMINI_RETRY_ATTEMPTS, GEMINI_TIMEOUT_RETRIES + 1)
+
+        while model_attempts < max_attempts:
+            model_attempts += 1
+            _ensure_pipeline_time()
+
+            try:
+                remaining = None
+                pipeline_deadline = _pipeline_deadline()
+                if pipeline_deadline is not None:
+                    remaining = max(1.0, pipeline_deadline - time.monotonic())
+
+                timeout_seconds = GEMINI_REQUEST_TIMEOUT_SECONDS
+                if remaining is not None:
+                    timeout_seconds = min(timeout_seconds, max(1.0, remaining - 0.5))
+
+                config = types.GenerateContentConfig(
+                    temperature=0,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=GEMINI_THINKING_LEVEL
+                    ),
+                    http_options=types.HttpOptions(
+                        timeout=int(timeout_seconds * 1000),
+                        retry_options=types.HttpRetryOptions(attempts=1),
+                    ),
+                )
+
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                result = (getattr(response, "text", "") or "").strip()
+                if not result:
+                    raise RuntimeError(
+                        f"Gemini returned an empty response from model '{model}'."
+                    )
+                return result
+
+            except Exception as exc:
+                code = _exception_code(exc)
+                timeout_error = _is_timeout_error(exc)
+                errors.append((model, code, exc))
+
+                if _is_quota_exhausted(exc):
+                    model_saw_quota = True
+                    quota_models.append(model)
+                    print(
+                        f"[Gemini] quota exhausted for model={model}; switching without retry",
+                        flush=True,
+                    )
+                    break
+
+                if code == 429:
+                    # A non-quota 429 is a short-lived rate limit. Give it only
+                    # the explicitly configured bounded retry, then switch model.
+                    if model_attempts >= GEMINI_429_RETRIES + 1:
+                        print(
+                            f"[Gemini] rate limit exhausted model={model}; switching fallback",
+                            flush=True,
+                        )
+                        break
+                    delay = min(5.0, _retry_delay(exc, model_attempts))
+                    deadline = _pipeline_deadline()
+                    if deadline is not None:
+                        delay = min(
+                            delay,
+                            max(0.0, deadline - time.monotonic() - 1.0),
+                        )
+                    if delay > 0:
+                        print(
+                            f"[Gemini] rate limited model={model}; retrying in {delay:.2f}s",
+                            flush=True,
+                        )
+                        time.sleep(delay)
+                    continue
+
+                if timeout_error:
+                    # Read/connect timeouts have no HTTP status code. Treat them
+                    # as transient, but keep the retry budget smaller than the
+                    # general 5xx budget so a slow model cannot consume the whole
+                    # Render request. After the bounded timeout retry, fallback.
+                    if model_attempts > GEMINI_TIMEOUT_RETRIES:
+                        print(
+                            f"[Gemini] timeout model={model}; switching fallback",
+                            flush=True,
+                        )
+                        break
+                    deadline = _pipeline_deadline()
+                    if deadline is not None and deadline - time.monotonic() <= 2:
+                        raise PipelineTimeoutError()
+                    delay = min(1.0, max(0.0, GEMINI_INITIAL_BACKOFF / 2))
+                    print(
+                        f"[Gemini] timeout model={model}; retrying once in {delay:.2f}s",
+                        flush=True,
+                    )
+                    if delay:
+                        time.sleep(delay)
+                    continue
+
+                if code in TRANSIENT_GEMINI_CODES:
+                    if model_attempts >= GEMINI_RETRY_ATTEMPTS:
+                        print(
+                            f"[Gemini] transient retries exhausted model={model} code={code}; switching fallback",
+                            flush=True,
+                        )
+                        break
+                    delay = _retry_delay(exc, model_attempts)
+                    deadline = _pipeline_deadline()
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 1.0:
+                            raise PipelineTimeoutError()
+                        delay = min(delay, remaining - 1.0)
+                    print(
+                        f"[Gemini] transient error model={model} code={code} "
+                        f"attempt={model_attempts}/{GEMINI_RETRY_ATTEMPTS}; "
+                        f"retrying in {delay:.2f}s",
+                        flush=True,
+                    )
+                    time.sleep(max(0.0, delay))
+                    continue
+
+                if code == 404:
+                    print(
+                        f"[Gemini] model '{model}' not found; switching fallback",
+                        flush=True,
+                    )
+                    break
+
+                # Authentication/permission and other deterministic failures
+                # should fail immediately rather than consuming the request budget.
+                raise GeminiServiceError(
+                    _friendly_gemini_error(exc, model),
+                    code="gemini_request_failed",
+                    status=code if code in (401, 403) else 502,
+                    retryable=False,
+                    details={"model": model, "http_code": code},
+                ) from exc
+
+        if model_saw_quota:
+            continue
+        if model_index < len(models) - 1:
+            print(
+                f"[Gemini] switching from '{model}' to fallback '{models[model_index + 1]}'",
+                flush=True,
+            )
+
+    if quota_models and len(quota_models) == len(models):
+        raise GeminiQuotaError(quota_models)
+
+    temporary = [
+        (m, c, e)
+        for m, c, e in errors
+        if c in TRANSIENT_GEMINI_CODES or c == 429 or _is_timeout_error(e)
+    ]
+    if temporary:
+        summary = "; ".join(
+            f"{m}:{c or e.__class__.__name__}" for m, c, e in temporary[-len(models):]
+        )
+        raise GeminiUnavailableError(
+            "All configured Gemini models were temporarily unavailable or timed out "
+            "after bounded retries/fallbacks. Please try again shortly.",
+            {"attempts": summary, "models": models},
+        )
+
+    raise GeminiServiceError(
+        "Gemini could not produce a response from any configured model.",
+        code="gemini_request_failed",
+        status=502,
+        retryable=False,
+        details={"models": models},
+    )
+
+def extract_json(text):
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            raise ValueError("Gemini did not return valid JSON.")
+        return json.loads(m.group(0))
+
+def extract_code(text, languages=("verilog","systemverilog","sv")):
+    for lang in languages:
+        m = re.search(rf"```{lang}\s*(.*?)```", text, re.I|re.S)
+        if m:
+            return m.group(1).strip()
+    m = re.search(r"```[^\n]*\s*(.*?)```", text, re.S)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+def extract_dot(text):
+    m = re.search(r"```(?:dot|graphviz)?\s*(.*?)```", text, re.I|re.S)
+    if m:
+        return m.group(1).strip()
+    start = text.find("digraph")
+    if start >= 0:
+        return text[start:].strip()
+    return text.strip()
+
+def safe_hdl(code):
+    forbidden = [
+        r"\$system\b", r"\$popen\b", r"\$fopen\b", r"\$fwrite\b",
+        r"\$readmem", r"\$writemem", r"\bimport\s+\"", r"\bDPI-C\b"
+    ]
+    return not any(re.search(p, code, re.I) for p in forbidden)
+
+def requirement_agent(user_request):
+    prompt = f"""
+You are the REQUIREMENT ANALYZER for an autonomous digital-ECE RTL engineering agent.
+
+The user can request ANY digital hardware design, not only textbook examples.
+Do not match against a fixed circuit list. Infer the engineering problem from the request.
+
+Return ONLY valid JSON with:
+design_name, problem_statement, domain, architecture_style, language,
+parameters, ports, clocking, reset, functional_requirements,
+corner_cases, assumptions, verification_strategy.
+
+domain may include:
+combinational, sequential, fsm, arithmetic, memory, fifo, communication,
+processor, bus, dsp, timing, control, fpga, asic, mixed_digital,
+or another precise digital-RTL category.
+
+If a detail is missing, choose a reasonable engineering default and put it in assumptions.
+Language must be SystemVerilog unless the request explicitly requires Verilog.
+
+USER REQUEST:
+{user_request}
+"""
+    return extract_json(gemini_text(prompt))
+
+def architecture_agent(spec):
+    prompt = f"""
+You are the HARDWARE ARCHITECT.
+
+Create an implementation-independent architecture plan for this digital RTL requirement.
+Think like a senior ECE/VLSI engineer. Do not assume the design is one of a fixed set.
+
+Return ONLY JSON:
+{{
+  "architecture_summary": "...",
+  "blocks": [{{"name":"...", "purpose":"...", "inputs":[...], "outputs":[...]}}],
+  "state_elements": [...],
+  "data_path": [...],
+  "control_path": [...],
+  "timing_behavior": [...],
+  "corner_case_behavior": [...],
+  "implementation_notes": [...],
+  "diagram_edges": [{{"from":"...", "to":"...", "label":"..."}}]
+}}
+
+SPEC:
+{json.dumps(spec, indent=2)}
+"""
+    return extract_json(gemini_text(prompt))
+
+def verification_plan_agent(spec, arch):
+    prompt = f"""
+You are the VERIFICATION ARCHITECT.
+
+Design a self-checking simulation strategy for arbitrary digital RTL.
+The testbench must independently determine expected behavior; do not simply duplicate
+the DUT's internal equations.
+
+Return ONLY JSON:
+{{
+  "strategy": "exhaustive|directed|random|mixed",
+  "test_categories": [...],
+  "reset_tests": [...],
+  "corner_cases": [...],
+  "expected_model": "...",
+  "coverage_goals": [...],
+  "pass_rule": "The testbench must print TEST_RESULT: PASS only when all checks pass."
+}}
+
+SPEC:
+{json.dumps(spec, indent=2)}
+
+ARCHITECTURE:
+{json.dumps(arch, indent=2)}
+"""
+    return extract_json(gemini_text(prompt))
+
+def rtl_agent(spec, arch):
+    prompt = f"""
+You are the RTL ENGINEER.
+
+Generate production-style synthesizable SystemVerilog for the requirement below.
+This is a general-purpose agent: infer the correct architecture rather than using a
+hard-coded circuit template.
+
+Rules:
+- Return ONLY SystemVerilog code, no explanation.
+- Use exactly the interface defined in the specification.
+- Use synthesizable constructs for the DUT.
+- Avoid vendor-specific primitives unless explicitly requested.
+- Make reset/clock behavior match the specification.
+- Parameterize only when requested or clearly useful.
+- Do not include testbench code.
+- Do not use system/file/network commands.
+
+SPEC:
+{json.dumps(spec, indent=2)}
+
+ARCHITECTURE:
+{json.dumps(arch, indent=2)}
+"""
+    code = extract_code(gemini_text(prompt))
+    if not safe_hdl(code):
+        raise ValueError("Generated RTL contains a forbidden simulation/system construct.")
+    return code
+
+def tb_agent(spec, arch, plan, rtl):
+    prompt = f"""
+You are the TESTBENCH ENGINEER.
+
+Generate a self-checking SystemVerilog testbench for the DUT below.
+
+Rules:
+- Instantiate the DUT exactly according to its module/ports.
+- Create clock/reset when required.
+- Build an INDEPENDENT expected/reference model from the specification.
+- Use exhaustive testing when the input/state space is small enough.
+- Otherwise use directed plus randomized tests covering corner cases.
+- Check outputs and relevant status flags.
+- For sequential designs, test reset, legal transitions, boundary conditions,
+  back-to-back operations and relevant latency.
+- End with exactly either "TEST_RESULT: PASS" or "TEST_RESULT: FAIL".
+- Print useful mismatch details.
+- Include $dumpfile/$dumpvars for waveform generation when practical.
+- Do not use shell/file/network system commands.
+- Return ONLY SystemVerilog code.
+
+SPEC:
+{json.dumps(spec, indent=2)}
+
+ARCHITECTURE:
+{json.dumps(arch, indent=2)}
+
+VERIFICATION PLAN:
+{json.dumps(plan, indent=2)}
+
+DUT RTL:
+```systemverilog
+{rtl}
+```
+"""
+    code = extract_code(gemini_text(prompt))
+    if not safe_hdl(code):
+        raise ValueError("Generated testbench contains a forbidden system construct.")
+    return code
+
+def simulate(rtl, tb, workdir):
+    workdir = Path(workdir)
+    dut = workdir / "design.sv"
+    bench = workdir / "testbench.sv"
+    out = workdir / "sim.out"
+    wave = workdir / "wave.vcd"
+    dut.write_text(rtl, encoding="utf-8")
+    bench.write_text(tb, encoding="utf-8")
+
+    compile_cmd = ["iverilog", "-g2012", "-s", "tb", "-o", str(out), str(dut), str(bench)]
+    deadline = _pipeline_deadline()
+    compile_timeout = SIM_TIMEOUT_SECONDS
+    if deadline is not None:
+        compile_timeout = max(0.5, min(SIM_TIMEOUT_SECONDS, deadline - time.monotonic()))
+    try:
+        cp = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=compile_timeout)
+    except FileNotFoundError:
+        return {"pass": False, "stage": "compile", "log": "iverilog is not installed."}
+    except subprocess.TimeoutExpired:
+        return {"pass": False, "stage": "compile", "log": "Compilation timed out."}
+
+    if cp.returncode != 0:
+        return {"pass": False, "stage": "compile", "log": cp.stdout + "\n" + cp.stderr}
+
+    deadline = _pipeline_deadline()
+    sim_timeout = SIM_TIMEOUT_SECONDS
+    if deadline is not None:
+        sim_timeout = max(0.5, min(SIM_TIMEOUT_SECONDS, deadline - time.monotonic()))
+    try:
+        rp = subprocess.run(["vvp", str(out)], cwd=workdir, capture_output=True,
+                            text=True, timeout=sim_timeout)
+    except subprocess.TimeoutExpired:
+        return {"pass": False, "stage": "simulation", "log": "Simulation timed out."}
+
+    log = (rp.stdout or "") + "\n" + (rp.stderr or "")
+    passed = rp.returncode == 0 and "TEST_RESULT: PASS" in log and "TEST_RESULT: FAIL" not in log
+    return {
+        "pass": passed,
+        "stage": "simulation",
+        "log": log,
+        "waveform": str(wave) if wave.exists() else None
+    }
+
+def debug_agent(spec, arch, plan, rtl, tb, sim):
+    prompt = f"""
+You are the DEBUG/REPAIR ENGINEER.
+
+A generated RTL project failed objective compilation or simulation.
+Determine whether the fault is in RTL, testbench, interface assumptions, timing/reset,
+or the verification model.
+
+Return ONLY JSON:
+{{
+  "diagnosis": "...",
+  "target": "rtl|testbench|both",
+  "corrected_rtl": "...",
+  "corrected_testbench": "..."
+}}
+
+Keep unchanged code unchanged where possible.
+Do not weaken tests just to make them pass.
+Do not remove checks to hide a failure.
+The final testbench must remain genuinely self-checking.
+
+SPEC:
+{json.dumps(spec, indent=2)}
+
+ARCHITECTURE:
+{json.dumps(arch, indent=2)}
+
+VERIFICATION PLAN:
+{json.dumps(plan, indent=2)}
+
+RTL:
+```systemverilog
+{rtl}
+```
+
+TESTBENCH:
+```systemverilog
+{tb}
+```
+
+SIMULATION RESULT:
+{json.dumps(sim, indent=2)}
+"""
+    result = extract_json(gemini_text(prompt))
+    if result.get("corrected_rtl") and not safe_hdl(result["corrected_rtl"]):
+        raise ValueError("Repair agent produced unsafe RTL.")
+    if result.get("corrected_testbench") and not safe_hdl(result["corrected_testbench"]):
+        raise ValueError("Repair agent produced unsafe testbench.")
+    return result
+
+def verification_critic(spec, arch, plan, rtl, tb, sim):
+    prompt = f"""
+You are an INDEPENDENT VERIFICATION CRITIC.
+
+Review the generated project. Do not override objective simulator results.
+Identify weak verification such as a TB that merely repeats DUT logic, missing
+corner cases, missing reset testing, wrong latency assumptions, or tests that
+can pass without exercising the design.
+
+Return ONLY JSON:
+{{
+  "simulation_pass": {str(bool(sim.get("pass"))).lower()},
+  "verification_quality": "strong|moderate|weak|failed",
+  "issues": [...],
+  "recommendation": "accept|regenerate_testbench|repair_rtl_and_testbench"
+}}
+
+SPEC:
+{json.dumps(spec, indent=2)}
+ARCHITECTURE:
+{json.dumps(arch, indent=2)}
+PLAN:
+{json.dumps(plan, indent=2)}
+RTL:
+{rtl}
+TESTBENCH:
+{tb}
+SIMULATION:
+{json.dumps(sim, indent=2)}
+"""
+    return extract_json(gemini_text(prompt))
+
+def diagram_agent(spec, arch):
+    prompt = f"""
+Create a Graphviz DOT architecture diagram for the digital design.
+Use ONLY blocks and connections supported by the architecture plan.
+Do not invent gates or internal signals that are not supported.
+Keep it readable.
+
+Return ONLY DOT beginning with digraph.
+
+SPEC:
+{json.dumps(spec, indent=2)}
+
+ARCHITECTURE:
+{json.dumps(arch, indent=2)}
+"""
+    dot = extract_dot(gemini_text(prompt))
+    if not dot.startswith("digraph"):
+        raise ValueError("Diagram agent did not return Graphviz DOT.")
+    return dot
+
+def render_svg(dot, path):
+    path = Path(path)
+    dot_file = path.with_suffix(".dot")
+    dot_file.write_text(dot, encoding="utf-8")
+    timeout = 10
+    deadline = _pipeline_deadline()
+    if deadline is not None:
+        timeout = max(0.5, min(timeout, deadline - time.monotonic()))
+    subprocess.run(["dot", "-Tsvg", str(dot_file), "-o", str(path)],
+                   capture_output=True, text=True, timeout=timeout, check=True)
+
+def make_zip(job_dir):
+    job_dir = Path(job_dir)
+    zip_path = job_dir / "rtl_ai_project.zip"
+    with __import__("zipfile").ZipFile(zip_path, "w") as z:
+        for p in job_dir.iterdir():
+            if p.is_file() and p.name != zip_path.name:
+                z.write(p, arcname=p.name)
+    return zip_path
+
+def run_pipeline(user_request):
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = JOB_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    deadline_token = _set_pipeline_deadline(time.monotonic() + MAX_PIPELINE_SECONDS)
+
+    try:
+        _ensure_pipeline_time()
+        spec = requirement_agent(user_request)
+        _ensure_pipeline_time()
+        arch = architecture_agent(spec)
+        _ensure_pipeline_time()
+        plan = verification_plan_agent(spec, arch)
+        _ensure_pipeline_time()
+        rtl = rtl_agent(spec, arch)
+        _ensure_pipeline_time()
+        tb = tb_agent(spec, arch, plan, rtl)
+
+        sim = None
+        repair_history = []
+
+        for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
+            _ensure_pipeline_time()
+            sim = simulate(rtl, tb, job_dir)
+            repair_history.append({"attempt": attempt, "simulation": sim})
+
+            if sim["pass"]:
+                break
+
+            if attempt >= MAX_REPAIR_ATTEMPTS:
+                break
+
+            _ensure_pipeline_time()
+            repair = debug_agent(spec, arch, plan, rtl, tb, sim)
+            rtl = repair.get("corrected_rtl") or rtl
+            tb = repair.get("corrected_testbench") or tb
+
+        _ensure_pipeline_time()
+        critic = verification_critic(spec, arch, plan, rtl, tb, sim)
+
+        _ensure_pipeline_time()
+        dot = diagram_agent(spec, arch)
+        svg_path = job_dir / "diagram.svg"
+        try:
+            render_svg(dot, svg_path)
+        except Exception as e:
+            svg_path.write_text(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='900' height='120'>"
+                "<text x='20' y='60'>Diagram rendering failed: "
+                + str(e).replace("&", "&amp;").replace("<", "&lt;")
+                + "</text></svg>", encoding="utf-8"
+            )
+
+        (job_dir / "design.sv").write_text(rtl, encoding="utf-8")
+        (job_dir / "testbench.sv").write_text(tb, encoding="utf-8")
+        (job_dir / "spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
+        (job_dir / "architecture.json").write_text(json.dumps(arch, indent=2), encoding="utf-8")
+        (job_dir / "verification_plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+        (job_dir / "verification_critic.json").write_text(json.dumps(critic, indent=2), encoding="utf-8")
+        (job_dir / "repair_history.json").write_text(json.dumps(repair_history, indent=2), encoding="utf-8")
+        (job_dir / "simulation.log").write_text(sim.get("log", ""), encoding="utf-8")
+        make_zip(job_dir)
+
+        return {
+            "job_id": job_id,
+            "spec": spec,
+            "architecture": arch,
+            "verification_plan": plan,
+            "rtl": rtl,
+            "testbench": tb,
+            "simulation": sim,
+            "verification_critic": critic,
+            "repair_history": repair_history,
+        }
+    finally:
+        _reset_pipeline_deadline(deadline_token)
+
+@app.get("/")
+def home():
+    return render_template_string(HTML)
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "gemini_configured": client is not None,
+        "gemini_model": MODEL,
+        "gemini_fallback_models": FALLBACK_MODELS,
+        "gemini_retry_attempts": GEMINI_RETRY_ATTEMPTS,
+        "gemini_429_retries": GEMINI_429_RETRIES,
+        "gemini_request_timeout_seconds": GEMINI_REQUEST_TIMEOUT_SECONDS,
+        "gemini_timeout_retries": GEMINI_TIMEOUT_RETRIES,
+        "gemini_thinking_level": GEMINI_THINKING_LEVEL,
+        "max_pipeline_seconds": MAX_PIPELINE_SECONDS,
+        "max_repair_attempts": MAX_REPAIR_ATTEMPTS,
+        "iverilog": shutil.which("iverilog") is not None,
+        "graphviz": shutil.which("dot") is not None,
+    })
+
+@app.post("/api/build")
+def api_build():
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error":"Request body must be JSON.","error_type":"invalid_request","retryable":False}), 400
+        user_request = (data.get("request") or "").strip()
+        if not user_request:
+            return jsonify({"error":"Missing hardware requirement.","error_type":"invalid_request","retryable":False}), 400
+        if len(user_request) > 12000:
+            return jsonify({"error":"Requirement is too long. Keep it under 12,000 characters.","error_type":"invalid_request","retryable":False}), 400
+
+        result = run_pipeline(user_request)
+        sim = result.get("simulation") or {}
+        critic = result.get("verification_critic") or {}
+
+        # Public API intentionally exposes only the clean user-facing result.
+        # Internal specification, architecture, verification plan, testbench,
+        # simulator logs, repair history and diagram data remain server-side.
+        return jsonify({
+            "rtl": result.get("rtl", ""),
+            "verification": {
+                "passed": bool(sim.get("pass")),
+                "quality": critic.get("verification_quality"),
+            },
+        }), 200
+    except GeminiServiceError as e:
+        app.logger.warning("Build stopped: %s", e)
+        return jsonify({"error":str(e),"error_type":e.code,"retryable":e.retryable}), e.status
+    except ValueError as e:
+        app.logger.warning("Build validation failed: %s", e)
+        return jsonify({"error":str(e),"error_type":"validation_error","retryable":False}), 422
+    except Exception as e:
+        app.logger.exception("Build failed")
+        return jsonify({"error":"The hardware build failed unexpectedly.","details":str(e),"error_type":"internal_error","retryable":False}), 500
+
+@app.get("/api/jobs/<job_id>/diagram.svg")
+def job_diagram(job_id):
+    path = JOB_ROOT / job_id / "diagram.svg"
+    if not path.exists():
+        return "Not found", 404
+    return send_file(path, mimetype="image/svg+xml")
+
+@app.get("/api/jobs/<job_id>/download")
+def job_download(job_id):
+    path = JOB_ROOT / job_id / "rtl_ai_project.zip"
+    if not path.exists():
+        return "Not found", 404
+    return send_file(path, as_attachment=True, download_name="rtl_ai_project.zip")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "7860"))
+    app.run(host="0.0.0.0", port=port, debug=False)
